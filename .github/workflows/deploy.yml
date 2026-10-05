@@ -1,0 +1,73 @@
+name: Deploy Background Worker to Cloud Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment target environment
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aevo-background-worker-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run build
+
+  deploy:
+    needs: verify
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main') && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker authentication for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ vars.GCP_REGION || 'asia-southeast1' }}-docker.pkg.dev --quiet
+
+      - name: Build and Push Worker Container
+        env:
+          REGION: ${{ vars.GCP_REGION || 'asia-southeast1' }}
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          IMAGE_TAG="$REGION-docker.pkg.dev/$PROJECT_ID/aevo/aevo-background-worker:${{ github.sha }}"
+          LATEST_TAG="$REGION-docker.pkg.dev/$PROJECT_ID/aevo/aevo-background-worker:latest"
+          docker build -t "$IMAGE_TAG" -t "$LATEST_TAG" .
+          docker push "$IMAGE_TAG"
+          docker push "$LATEST_TAG"
+
+      - name: Deploy to Cloud Run Service
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: aevo-background-worker-${{ github.event.inputs.environment || 'staging' }}
+          image: ${{ vars.GCP_REGION || 'asia-southeast1' }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/aevo/aevo-background-worker:${{ github.sha }}
+          region: ${{ vars.GCP_REGION || 'asia-southeast1' }}
